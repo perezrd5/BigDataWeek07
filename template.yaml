@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Iris ETL with Step Functions and an IAM-authenticated prediction REST API.
+Metadata:
+  "com.aws.cloudformation.Context":
+    ref:
+      - at: README.md
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 20
+    MemorySize: 256
+
+Resources:
+  # Preserve ingested inputs so each workflow execution can be traced and replayed.
+  RawBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RawBucket.Arn
+              - !Sub '${RawBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  # Retain the cleaned snapshots and earlier model versions after stack deletion.
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+  ProcessedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ProcessedBucket.Arn
+              - !Sub '${ProcessedBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  TransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: pipeline.transform
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${RawBucket.Arn}/raw/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ProcessedBucket.Arn}/processed/*'
+
+  # The runner uses execution history and the task output to verify the S3 result.
+  EtlWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TransformFunction
+      Definition:
+        StartAt: CleanAndStore
+        TimeoutSeconds: 120
+        States:
+          CleanAndStore:
+            Type: Task
+            Resource: !Sub 'arn:${AWS::Partition}:states:::lambda:invoke'
+            Parameters:
+              FunctionName: !GetAtt TransformFunction.Arn
+              Payload.$: '$'
+            OutputPath: '$.Payload'
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                BackoffRate: 2
+                MaxAttempts: 3
+            End: true
+
+  PredictionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      EndpointConfiguration: REGIONAL
+      # Signed requests let authorized AWS principals call the model.
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        InvokeRole: NONE
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+
+  PredictionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: pipeline.inference
+      Environment:
+        Variables:
+          MODEL_BUCKET: !Ref ProcessedBucket
+          MODEL_KEY: models/iris.json
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${ProcessedBucket.Arn}/models/iris.json'
+      Events:
+        Predict:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PredictionApi
+            Path: /predict
+            Method: post
+
+Outputs:
+  RawBucketName:
+    Value: !Ref RawBucket
+  ProcessedBucketName:
+    Value: !Ref ProcessedBucket
+  WorkflowArn:
+    Value: !Ref EtlWorkflow
+  PredictionUrl:
+    Value: !Sub 'https://${PredictionApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/predict'
